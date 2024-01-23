@@ -137,13 +137,13 @@ end
 struct StaticGetter{i} end
 (::StaticGetter{i})(v) where {i} = v[i]
 (::StaticGetter{i})(::Nothing) where {i} = nothing
-function _unzip(tuples, ::Val{N}) where {N}
+function _unzip(tuples, N)
   getters = ntuple(n -> StaticGetter{n}(), N)
   map(g -> map(g, tuples), getters)
 end
 function unzip(tuples)
   N = length(first(tuples))
-  _unzip(tuples, Val(N))
+  _unzip(tuples, N)
 end
 
 # Reverse iteration order in ∇map, for stateful functions.
@@ -169,12 +169,12 @@ _reverse(x::Symmetric) = Symmetric(_reverse(x.data), x.uplo == 'U' ? :L : :U)
 # With mismatched lengths, map stops early. With mismatched shapes, it makes a vector.
 # So we keep axes(x) to restore gradient dx to its full length & correct shape.
 _tryaxes(x) = axes(x)
-_tryaxes(x::Tuple) = Val(length(x))
-_tryaxes(x::Number) = x
+_tryaxes(x::Tuple) = length(x)
+_tryaxes(x::Number) = 0
 _restore(dx::AbstractArray{Nothing}, ax::Tuple) = similar(dx, ax)
 _restore(dx, ax::Tuple) = axes(dx) == ax ? dx : reshape(vcat(dx, falses(prod(map(length, ax)) - length(dx))), ax)
-_restore(dx, ::Val{N}) where {N} = ntuple(i -> get(dx,i,nothing), N)
-_restore(dx, ::Number) = only(dx)
+_restore(dx, N::Int) = N == 0 ? only(dx) : ntuple(i -> get(dx,i,nothing), N)
+_tryrestoreaxes(dx, ax) = _restore(dx, _tryaxes(ax))
 
 # Sometimes a pullback doesn't return a Tuple, but rather returns only a
 # single nothing to say "all arguments have zero cotangent". This function is needed to
@@ -186,22 +186,22 @@ for (mapfunc,∇mapfunc) in [(:map,:∇map),(:pmap,:∇pmap)]
   @eval function $∇mapfunc(cx, f::F, args::Vararg{Any, N}) where {F, N}
     ys_and_backs = $mapfunc((args...) -> _pullback(cx, f, args...), args...)
     ys = map(first, ys_and_backs)
-    arg_ax = map(_tryaxes, args)
+    # arg_ax = map(_tryaxes, args)
     function map_back(Δ)
       if Base.issingletontype(F) && length(args) == 1
         Δarg = $mapfunc(((_,pb), δ) -> last_or_nothing(pb(δ)), ys_and_backs, Δ) # No unzip needed
         (nothing, Δarg)
       elseif Base.issingletontype(F)
         # Ensures `f` is pure: nothing captured & no state.
-        unzipped = _unzip($mapfunc(((_,pb), δ) -> tailmemaybe(pb(δ)), ys_and_backs, Δ), Val(N))
-        Δargs = map(_restore, unzipped, arg_ax)
+        unzipped = _unzip($mapfunc(((_,pb), δ) -> tailmemaybe(pb(δ)), ys_and_backs, Δ), N)
+        Δargs = map(_tryrestoreaxes, unzipped, args)
         (nothing, Δargs...)
       else
         # Apply pullbacks in reverse order. Needed for correctness if `f` is stateful.
         Δf_and_args_zipped = $mapfunc(((_,pb), δ) -> pb(δ), _tryreverse($mapfunc, ys_and_backs, Δ)...)
-        Δf_and_args = _unzip(_tryreverse($mapfunc, Δf_and_args_zipped), Val(N + 1))
+        Δf_and_args = _unzip(_tryreverse($mapfunc, Δf_and_args_zipped), N + 1)
         Δf = reduce(accum, Δf_and_args[1]; init=nothing)
-        Δargs = map(_restore, Δf_and_args[2:end], arg_ax)
+        Δargs = map(_tryrestoreaxes, Δf_and_args[2:end], args)
         (Δf, Δargs...)
       end
     end
@@ -280,7 +280,7 @@ function productfunc(xs, dy)
   map(first(dy), xs, cdim, getters) do dyn, x, cd, getter
     dyn === nothing && return nothing
     nd = _ndims(x)
-    dims = nd == 0 ? (:) : ntuple(i -> i<cd ? i : i+nd, Val(ndims(dy)-nd))
+    dims = nd == 0 ? (:) : ntuple(i -> i<cd ? i : i+nd, ndims(dy)-nd)
     init = map(zero, dyn) # allows for tuples, which accum can add:
     red = mapreduce(getter, accum, dy; dims, init)
     return _project(x, nd == 0 ? red : reshape(red, axes(x)))

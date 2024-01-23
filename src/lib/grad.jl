@@ -218,15 +218,18 @@ function withjacobian(f, pars::Params)
   (val=y, grad=Grads(out, pars))
 end
 
+struct StaticSplice{n} end
+(::StaticSplice{n})(x, args...) where n = ntuple(i -> i==n ? x : args[i], length(args))
+
 """
     diaghessian(f, args...) -> Tuple
 
 Diagonal part of the Hessian. Returns a tuple containing, for each argument `x`,
-`h` of the same shape with `h[i] = Hᵢᵢ = ∂²y/∂x[i]∂x[i]`. 
+`h` of the same shape with `h[i] = Hᵢᵢ = ∂²y/∂x[i]∂x[i]`.
 The original evaluation `y = f(args...)` must give a real number `y`.
 
 For one vector argument `x`, this is equivalent to `(diag(hessian(f,x)),)`.
-Like [`hessian`](@ref) it uses ForwardDiff over Zygote. 
+Like [`hessian`](@ref) it uses ForwardDiff over Zygote.
 
 !!! warning
     For arguments of any type except `Number` & `AbstractArray`, the result is `nothing`.
@@ -254,15 +257,15 @@ julia> hessian(xy -> atan(xy[1], xy[2]), [1, 2])  # full Hessian is not diagonal
 ```
 """
 function diaghessian(f, args...)
-  ntuple(length(args)) do n
-    let x = args[n], valn = Val(n)  # let Val improves speed, sometimes
-      if x isa AbstractArray
-        forward_diag(x -> gradient(f, _splice(x, args, valn)...)[n], x)[2]
-      elseif x isa Number
-        ForwardDiff.derivative(x -> gradient(f, _splice(x, args, valn)...)[n], x)
-      end
+  getters = ntuple(n -> StaticGetter{n}(), length(args))
+  splices = ntuple(n -> StaticSplice{n}(), length(args))
+  map(args, getters, splices) do x, g, s
+    if x isa AbstractArray
+      forward_diag(x -> g(gradient(f, s(x, args...)...)), x)[2]
+    elseif x isa Number
+      ForwardDiff.derivative(x -> g(gradient(f, s(x, args...)...)), x)
+    else
+        throw(ArgumentError("unsupported type of hessian, got $x"))
     end
   end
 end
-
-_splice(x, args, ::Val{n}) where {n} = ntuple(i -> i==n ? x : args[i], length(args))

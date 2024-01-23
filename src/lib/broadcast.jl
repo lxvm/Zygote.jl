@@ -183,8 +183,6 @@ end
 # issues, or something similar) and the other operations needed take it to about
 # 100x overhead.
 
-@generated inclen(::NTuple{N,Any}) where N = Val(N+1)
-
 # Avoid hitting special cases for `Adjoint` etc.
 _broadcast(f::F, x...) where F = materialize(broadcasted(f, x...))
 
@@ -211,12 +209,11 @@ _dual_safearg(x) = false
   elseif T <: Union{Real, Complex} && isconcretetype(T) && _dual_purefun(F) && all(_dual_safearg, args) && !isderiving()
     return broadcast_forward(f, args...)
   end
-  len = inclen(args)
+  getters = ntuple(i -> StaticGetter{i}(), length(args)+1)
   y∂b = _broadcast((x...) -> _pullback(__context__, f, x...), args...)
   y = broadcast(first, y∂b)
   function ∇broadcasted(ȳ)
     dxs_zip = map(((_, pb), ȳ₁) -> pb(ȳ₁), y∂b, ȳ)
-    getters = ntuple(i -> StaticGetter{i}(), len)
     dxs = map(g -> collapse_nothings(map(g, dxs_zip)), getters)
     (nothing, accum_sum(dxs[1]), map(unbroadcast, args, Base.tail(dxs))...)
   end
@@ -252,20 +249,20 @@ using ForwardDiff: Dual, Partials, value, partials
 
 # We do this because it ensures type stability so it compiles nicely on the gpu
 # The val is needed for some type stability
-@inline dual(x, i, ::Val{N}) where {N} = x
-@inline dual(x::Bool, i, ::Val{N}) where {N} = x
-@inline dual(x::Real, i, ::Val{N}) where {N} = Dual(x, ntuple(==(i), N))
+@inline dual(x, i, N) = x
+@inline dual(x::Bool, i, N) = x
+@inline dual(x::Real, i, N) = Dual(x, ntuple(==(i), N))
 # For complex since ForwardDiff.jl doesn't play nicely with complex numbers we
 # construct a Complex dual number and tag the real and imaginary parts separately
-@inline function dual(x::Complex{T}, i, ::Val{N}) where {T,N}
+@inline function dual(x::Complex, i, N)
     re_dual = Dual(real(x), ntuple(==(i), 2N))
     im_dual = Dual(imag(x), ntuple(==(N+i), 2N))
     return Complex(re_dual, im_dual)
 end
 
-function dualize(args::Vararg{Any, N}) where {N}
-    ds = map(args, ntuple(identity,N)) do x, i
-        return dual(x, i, Val(N))
+function dualize(args...)
+    ds = map(args, ntuple(identity,length(args))) do x, i
+        return dual(x, i, length(args))
       end
       return ds
 end
@@ -290,12 +287,11 @@ end
 end
 
 # Real input and real output pullback
-@inline function _broadcast_forward(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
-  valN = Val(N)
+@inline function _broadcast_forward(::Type{<:Dual}, out, args...)
   y = broadcast(x -> value(x), out)
   function bc_fwd_back(ȳ)
-    dargs = ntuple(valN) do i
-      unbroadcast(args[i], broadcast((y1, o1) -> y1 * partials(o1,i), ȳ, out))
+    dargs = map(args, ntuple(identity,length(args))) do arg, i
+      unbroadcast(arg, broadcast((y1, o1) -> y1 * partials(o1,i), ȳ, out))
     end
     (nothing, nothing, dargs...) # nothings for broadcasted & f
   end
@@ -303,12 +299,11 @@ end
 end
 
 # This handles the complex output and real input pullback
-@inline function _broadcast_forward(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
-    valN = Val(N)
+@inline function _broadcast_forward(::Type{<:Complex}, out, args...)
     y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
     function bc_fwd_back(ȳ)
-      dargs = ntuple(valN) do i
-        unbroadcast(args[i], broadcast((y1, o1) -> (real(y1)*partials(real(o1),i) + imag(y1)*partials(imag(o1), i)), ȳ, out))
+      dargs = map(args, ntuple(identity,length(args))) do arg, i
+        unbroadcast(arg, broadcast((y1, o1) -> (real(y1)*partials(real(o1),i) + imag(y1)*partials(imag(o1), i)), ȳ, out))
       end
       (nothing, nothing, dargs...) # nothings for broadcasted & f
     end
@@ -317,12 +312,11 @@ end
 
 # This handles complex input and real output. We use the gradient definition from ChainRules here
 # since it agrees with what Zygote did for real(x).
-@inline function _broadcast_forward_complex(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
-    valN = Val(N)
+@inline function _broadcast_forward_complex(::Type{<:Dual}, out, args...)
     y = broadcast(x -> value(x), out)
     function bc_fwd_back(ȳ)
-      dargs = ntuple(valN) do i
-        unbroadcast(args[i], broadcast((y1, o1) -> y1 * Complex(partials(o1, i), partials(o1, i+N)), ȳ, out))
+      dargs = map(args, ntuple(identity,length(args))) do arg, i
+        unbroadcast(arg, broadcast((y1, o1) -> y1 * Complex(partials(o1, i), partials(o1, i+N)), ȳ, out))
       end
       (nothing, nothing, dargs...) # nothings for broadcasted & f
     end
@@ -341,12 +335,11 @@ function _adjoint_complex(N, Δz, df, i)
     return Complex(Δu*partials(du, i) + Δv*partials(dv, i), Δu*partials(du, i+N) + Δv*partials(dv, i+N))
 end
 
-@inline function _broadcast_forward_complex(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
-    valN = Val(N)
+@inline function _broadcast_forward_complex(::Type{<:Complex}, out, args...)
     y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
     function bc_fwd_back(ȳ)
-      dargs = ntuple(valN) do i
-        unbroadcast(args[i], broadcast((y1, o1) -> _adjoint_complex(N, y1, o1, i), ȳ, out))
+      dargs = map(args, ntuple(identity,length(args))) do arg, i
+        unbroadcast(arg, broadcast((y1, o1) -> _adjoint_complex(N, y1, o1, i), ȳ, out))
       end
       (nothing, nothing, dargs...) # nothings for broadcasted & f
     end
